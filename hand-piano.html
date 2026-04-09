@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Hand Tracking Piano</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #0a0a0f;
+      color: #f0f0f0;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+
+    h1 {
+      font-size: 16px;
+      font-weight: 400;
+      letter-spacing: 0.15em;
+      color: #666;
+      margin-bottom: 14px;
+      text-transform: uppercase;
+    }
+
+    #container {
+      position: relative;
+      width: 100%;
+      max-width: 700px;
+    }
+
+    #videoEl { display: none; }
+
+    #canvas {
+      width: 100%;
+      border-radius: 12px;
+      border: 1px solid #222;
+      background: #111;
+      display: block;
+    }
+
+    #status {
+      font-size: 13px;
+      color: #666;
+      margin: 10px 0 4px;
+      text-align: center;
+    }
+
+    #info {
+      font-size: 12px;
+      color: #444;
+      text-align: center;
+      margin-top: 6px;
+    }
+
+    #noteDisplay {
+      font-size: 28px;
+      font-weight: 300;
+      color: #5aabee;
+      text-align: center;
+      height: 36px;
+      margin-top: 10px;
+      letter-spacing: 0.2em;
+      transition: opacity 0.3s;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Hand Piano</h1>
+
+  <div id="container">
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <video id="videoEl" autoplay playsinline width="640" height="480"></video>
+    <p id="status">Initialising camera...</p>
+    <div id="noteDisplay"></div>
+    <p id="info">Hover any fingertip over a piano key to play it</p>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const video = document.getElementById('videoEl');
+    const statusEl = document.getElementById('status');
+    const noteDisplay = document.getElementById('noteDisplay');
+
+    // --- Audio context ---
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+    // --- Piano keys: 1 octave C4 to C5 ---
+    const whiteNotes = [
+      { note: 'C4',  freq: 261.63 },
+      { note: 'D4',  freq: 293.66 },
+      { note: 'E4',  freq: 329.63 },
+      { note: 'F4',  freq: 349.23 },
+      { note: 'G4',  freq: 392.00 },
+      { note: 'A4',  freq: 440.00 },
+      { note: 'B4',  freq: 493.88 },
+      { note: 'C5',  freq: 523.25 },
+    ];
+
+    const blackNotes = [
+      { note: 'C#4', freq: 277.18, after: 0 },
+      { note: 'D#4', freq: 311.13, after: 1 },
+      null,
+      { note: 'F#4', freq: 369.99, after: 3 },
+      { note: 'G#4', freq: 415.30, after: 4 },
+      { note: 'A#4', freq: 466.16, after: 5 },
+      null,
+    ];
+
+    // Piano layout constants (will be computed in draw)
+    const PIANO_HEIGHT = 130;
+    const WHITE_KEY_COUNT = 8;
+    let whiteKeyW = 0;
+    let blackKeyW = 0;
+    let blackKeyH = 0;
+    let pianoY = 0;
+
+    // Track which keys are active (being hovered)
+    let activeKeys = new Set();
+    // Cooldown per note so it doesn't retrigger every frame
+    let noteCooldown = {};
+
+    function playNote(freq, noteName) {
+      const now = audioCtx.currentTime;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(freq, now);
+
+      gain.gain.setValueAtTime(0, now);
+      gain.gain.linearRampToValueAtTime(0.5, now + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 1.2);
+
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(now);
+      osc.stop(now + 1.2);
+
+      noteDisplay.textContent = noteName;
+      setTimeout(() => { noteDisplay.textContent = ''; }, 800);
+    }
+
+    function getKeyRects() {
+      whiteKeyW = canvas.width / WHITE_KEY_COUNT;
+      blackKeyW = whiteKeyW * 0.6;
+      blackKeyH = PIANO_HEIGHT * 0.62;
+      pianoY = canvas.height - PIANO_HEIGHT;
+
+      const whites = whiteNotes.map((n, i) => ({
+        ...n,
+        x: i * whiteKeyW,
+        y: pianoY,
+        w: whiteKeyW - 2,
+        h: PIANO_HEIGHT,
+        isBlack: false
+      }));
+
+      const blacks = [];
+      blackNotes.forEach((n, i) => {
+        if (!n) return;
+        blacks.push({
+          ...n,
+          x: (n.after + 1) * whiteKeyW - blackKeyW / 2,
+          y: pianoY,
+          w: blackKeyW,
+          h: blackKeyH,
+          isBlack: true
+        });
+      });
+
+      return { whites, blacks };
+    }
+
+    function drawPiano(activeKeys) {
+      const { whites, blacks } = getKeyRects();
+
+      // White keys
+      for (const k of whites) {
+        const isActive = activeKeys.has(k.note);
+        ctx.fillStyle = isActive ? '#a8d8ff' : '#f5f5f0';
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.roundRect(k.x, k.y, k.w, k.h, [0, 0, 6, 6]);
+        ctx.fill();
+        ctx.stroke();
+
+        // Glow when active
+        if (isActive) {
+          ctx.save();
+          ctx.shadowColor = '#5aabee';
+          ctx.shadowBlur = 18;
+          ctx.fillStyle = '#a8d8ff';
+          ctx.beginPath();
+          ctx.roundRect(k.x, k.y, k.w, k.h, [0, 0, 6, 6]);
+          ctx.fill();
+          ctx.restore();
+        }
+
+        // Note label
+        ctx.fillStyle = isActive ? '#0a4a7a' : '#999';
+        ctx.font = '11px Segoe UI';
+        ctx.textAlign = 'center';
+        ctx.fillText(k.note, k.x + k.w / 2, k.y + k.h - 12);
+      }
+
+      // Black keys
+      for (const k of blacks) {
+        const isActive = activeKeys.has(k.note);
+        ctx.fillStyle = isActive ? '#3a7abf' : '#1a1a1a';
+        ctx.beginPath();
+        ctx.roundRect(k.x, k.y, k.w, k.h, [0, 0, 4, 4]);
+        ctx.fill();
+
+        if (isActive) {
+          ctx.save();
+          ctx.shadowColor = '#5aabee';
+          ctx.shadowBlur = 14;
+          ctx.fillStyle = '#3a7abf';
+          ctx.beginPath();
+          ctx.roundRect(k.x, k.y, k.w, k.h, [0, 0, 4, 4]);
+          ctx.fill();
+          ctx.restore();
+        }
+      }
+    }
+
+    function checkFingerOnKeys(landmarks) {
+      const { whites, blacks } = getKeyRects();
+      const fingerTips = [4, 8, 12, 16, 20]; // thumb, index, middle, ring, pinky
+      const newActive = new Set();
+
+      for (const idx of fingerTips) {
+        const lm = landmarks[idx];
+        // Mirror x because video is flipped
+        const fx = (1 - lm.x) * canvas.width;
+        const fy = lm.y * canvas.height;
+
+        // Check black keys first (they're on top)
+        let hit = false;
+        for (const k of blacks) {
+          if (fx >= k.x && fx <= k.x + k.w && fy >= k.y && fy <= k.y + k.h) {
+            newActive.add(k.note);
+            hit = true;
+            // Trigger sound with cooldown
+            if (!noteCooldown[k.note]) {
+              playNote(k.freq, k.note);
+              noteCooldown[k.note] = true;
+              setTimeout(() => { delete noteCooldown[k.note]; }, 400);
+            }
+            break;
+          }
+        }
+        if (hit) continue;
+
+        for (const k of whites) {
+          if (fx >= k.x && fx <= k.x + k.w && fy >= k.y && fy <= k.y + k.h) {
+            newActive.add(k.note);
+            if (!noteCooldown[k.note]) {
+              playNote(k.freq, k.note);
+              noteCooldown[k.note] = true;
+              setTimeout(() => { delete noteCooldown[k.note]; }, 400);
+            }
+          }
+        }
+      }
+
+      return newActive;
+    }
+
+    function drawSkeleton(hand) {
+      const connections = [
+        [0,1],[1,2],[2,3],[3,4],
+        [0,5],[5,6],[6,7],[7,8],
+        [5,9],[9,10],[10,11],[11,12],
+        [9,13],[13,14],[14,15],[15,16],
+        [13,17],[17,18],[18,19],[19,20],[0,17]
+      ];
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+      ctx.lineWidth = 1;
+      for (const [a, b] of connections) {
+        const p1x = (1 - hand[a].x) * canvas.width;
+        const p1y = hand[a].y * canvas.height;
+        const p2x = (1 - hand[b].x) * canvas.width;
+        const p2y = hand[b].y * canvas.height;
+        ctx.beginPath(); ctx.moveTo(p1x, p1y); ctx.lineTo(p2x, p2y); ctx.stroke();
+      }
+      const fingerTips = [4, 8, 12, 16, 20];
+      for (let i = 0; i < 21; i++) {
+        const px = (1 - hand[i].x) * canvas.width;
+        const py = hand[i].y * canvas.height;
+        ctx.beginPath(); ctx.arc(px, py, fingerTips.includes(i) ? 6 : 3, 0, Math.PI * 2);
+        ctx.fillStyle = fingerTips.includes(i) ? '#5aabee' : 'rgba(255,255,255,0.4)';
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    let handsData = [];
+
+    function render() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw mirrored video
+      ctx.save();
+      ctx.scale(-1, 1);
+      ctx.translate(-canvas.width, 0);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      ctx.restore();
+
+      // Collect active keys from all hands
+      activeKeys = new Set();
+      for (const hand of handsData) {
+        drawSkeleton(hand.landmarks);
+        const keys = checkFingerOnKeys(hand.landmarks);
+        keys.forEach(k => activeKeys.add(k));
+      }
+
+      drawPiano(activeKeys);
+      requestAnimationFrame(render);
+    }
+
+    async function init() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, facingMode: 'user' }
+        });
+        video.srcObject = stream;
+        await new Promise(r => video.onloadedmetadata = r);
+        statusEl.textContent = 'Camera ready — loading hand tracker...';
+
+        const hands = new Hands({
+          locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+        });
+        hands.setOptions({
+          maxNumHands: 2,
+          modelComplexity: 1,
+          minDetectionConfidence: 0.7,
+          minTrackingConfidence: 0.6
+        });
+        hands.onResults(results => {
+          handsData = results.multiHandLandmarks
+            ? results.multiHandLandmarks.map((lms, i) => ({
+                landmarks: lms,
+                handedness: results.multiHandedness[i]
+              }))
+            : [];
+          statusEl.textContent = handsData.length > 0
+            ? `Tracking ${handsData.length} hand${handsData.length > 1 ? 's' : ''}`
+            : 'Show your hands to the camera';
+        });
+
+        const camera = new Camera(video, {
+          onFrame: async () => { await hands.send({ image: video }); },
+          width: 640, height: 480
+        });
+        await camera.start();
+        statusEl.textContent = 'Show your hands to the camera';
+        render();
+
+      } catch (e) {
+        statusEl.textContent = 'Camera access denied — allow permissions and reload.';
+        console.error(e);
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>
