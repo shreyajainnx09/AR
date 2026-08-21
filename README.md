@@ -1,6 +1,6 @@
 # Hand Tracking Piano
 
-**Live demo:** https://shreyajainnx.github.io/AR/
+**Live demo:** https://shreyajainnx09.github.io/Hand-Tracking-PIano-AR/
 
 ## Description
 A browser-based augmented reality piano that uses your webcam and hand-tracking to let you "play" piano keys in mid-air. Hover any fingertip over an on-screen key and it plays — no physical keyboard or MIDI hardware required.
